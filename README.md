@@ -24,7 +24,7 @@ The workflow steps are as follow:
     - `sendEmail.pl` which can send the email to the {<direktiv-url>}:2525 listener.
 
 *You need the following components to run this workflow:*
-- Ability to upload to an Azure Storage Container, with Azure Events configured to send to Direktiv namespace (https://docs.direktiv.io/events/cloud/azure/).
+- Ability to upload to an Azure Storage Container, with Azure Events configured to send to Direktiv namespace (https://docs.direktiv.io/events/cloud/azure/). Example screenshots have been included in the repository.
 - The email attachments are uploaded to the `Storage accounts -> direktiv | Containers -> emails`.
  
  ## Variables
