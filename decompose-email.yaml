@@ -1,0 +1,270 @@
+# 
+# The workflow steps are as follow:
+# 1. Receive an event when an email is received
+# 2. Strip the attachments and upload these to an Azure Blob Storage container with the following structure: datetime-from-to
+# 3. Get the link for the attachments from the Azure Blob Storage
+# 4. Write the following to a database (mysql://username:password@emails.uid.region.rds.amazonaws.com:3306):
+#     - Datetime:from:to:subject:[attachments links]
+# 5. Send a Slack and Teams message with the details of the database write and the links
+# 6. Recompile a mail and forward it on with the message body (original) + [attachments links]
+
+description: "This is the master workflow for decompising the email object"
+
+# The start definition which starts the worklfow based on the event received from the
+# the email listener.
+#
+start:
+  type: event
+  state: strip-event-data
+  event: 
+    type: "smtp.message"
+
+functions:
+  # Run all the Azure commands
+  - id: azure
+    image: gcr.io/direktiv/functions/azure:1.0
+    type: knative-workflow
+
+  # SQL container for writing to databases
+  - id: usql
+    image: gcr.io/direktiv/functions/usql:1.0
+    type: knative-workflow
+
+  # Send email container
+  - id: send-email
+    image: gcr.io/direktiv/functions/sendmail:1.0
+    type: knative-workflow  
+
+  # Create an email template using mustache
+  - id: email-template
+    image: gcr.io/direktiv/functions/mustache:1.0
+    type: knative-workflow
+
+  # Function for the Microsoft Teams webhook message transport
+  - id: teams
+    image: gcr.io/direktiv/functions/teams:1.0
+    type: knative-workflow
+
+  # Slack message container
+  - id: slack
+    image: gcr.io/direktiv/functions/slack:1.0
+    type: knative-workflow
+
+states:
+  #
+  # Strip the event information we don't need
+  #
+  - id: strip-event-data
+    type: noop
+    transform: 'jq(."smtp.message".data + { files: [] } )'
+    transition: check-attachments
+
+  #
+  # Check in the loop if we managed all the attachments
+  #
+  - id: check-attachments
+    type: switch
+    conditions:
+      - condition: 'jq((.attachments | length) > 0)'
+        transition: store-attachment
+    defaultTransform: 'jq( del(.attachments))'
+    defaultTransition: upload-azure
+
+  #
+  # Store the attachments in the Direktiv variable state
+  #
+  - id: store-attachment
+    type: setter
+    log: jq(.attachments[0])
+    variables:
+      - key: 'jq(.attachments[0].name)'
+        scope: instance
+        mimeType: application/octet-stream
+        value: 'jq(.attachments[0].data)'
+    transform: 'jq( .files += [{ name: .attachments[0].name }] | del (.attachments[0]) )'
+    transition: check-attachments
+
+  #
+  # Upload the attachments to Azure Blob Storage
+  #
+  - id: upload-azure
+    type: foreach
+    log: Uplaoding files to the Azure Storage container "emails"
+    array: 'jq(.files)'
+    action:
+      function: azure
+      secrets: ["AZURE_USER", "AZURE_PASSWORD", "AZURE_TENANTID", "AZURE_STORAGE_ACCOUNT"]
+      files:
+      - key: jq(.name)
+        scope: instance
+        as: jq(.name)
+      input:
+        auth:
+          user: jq(.secrets.AZURE_USER)
+          password: jq(.secrets.AZURE_PASSWORD)
+          tenant: jq(.secrets.AZURE_TENANTID)
+        commands:
+        - command: az storage blob upload --account-name jq(.secrets.AZURE_STORAGE_ACCOUNT) --container-name emails --name jq(.name) --file jq(.name) --overwrite --auth-mode login
+        # - command: az storage blob show --account-name jq(.secrets.AZURE_STORAGE_ACCOUNT) --container-name emails --name jq(.name) --auth-mode login
+    transition: write-to-database
+
+  #
+  # Write to the database the details about the email
+  #
+  - id: write-to-database
+    # log: jq(.)
+    log: Writing the information to the MySQL database hosted in AWS emails.cjiysk5izzv7.us-west-1.rds.amazonaws.com
+    type: action
+    action:
+      function: usql
+      secrets: ["SQL_USER", "SQL_PASSWORD", "SQL_ADDRESS", "AZURE_STORAGE_ACCOUNT"]
+      input: 
+        connection: 'jq("mysql://" + (.secrets.SQL_USER | @uri) + ":" + (.secrets.SQL_PASSWORD | @uri) + "@" + (.secrets.SQL_ADDRESS) + ":3306/direktiv")'
+        queries:
+        - query: |
+            INSERT INTO emails (`create_time`,`update_time`,`from`,`to`,`subject`,`message`,`attachement_links`)
+            VALUES (
+            'jq(now | strftime("%Y-%m-%d %H:%M:%S"))',
+            'jq(now | strftime("%Y-%m-%d %H:%M:%S"))',
+            'jq(.from)',
+            'jq(.to)',
+            'jq(.subject)',
+            'jq(.message)',
+            'jq(. as $obj | [ .files[] | "https://" + $obj.secrets.AZURE_STORAGE_ACCOUNT + ".blob.core.windows.net/emails/" + .name ])'
+            )
+    transition: create-email-template
+    transform: 'jq(. + { urls: (. as $obj | [ .files[] | "https://direktiv.blob.core.windows.net/emails/" + .name ] ) } )'
+
+  #
+  # Create the email content using an email template 
+  #
+  - id: create-email-template
+    # log: jq(.)
+    log: Creating the email template
+    type: action
+    action:
+      function: email-template
+      secrets: ["AZURE_STORAGE_ACCOUNT"]
+      files:
+      - key: email-template.tpl
+        scope: workflow
+      input: 
+        template: email-template.tpl
+        data: 'jq(. + {storageaccount: .secrets.AZURE_STORAGE_ACCOUNT})'
+    transition: send-email
+
+  #
+  # Send an unencrypted email message with the attachments.
+  #
+  - id: send-email
+    # log: jq(.)
+    log: Sending email to the original recepients
+    type: action
+    action:
+      secrets: ["EMAIL_USER", "EMAIL_PASSWORD"]
+      function: send-email
+      input: 
+        smtp:
+          server: smtp.gmail.com:587
+          user: jq(.secrets.EMAIL_USER)
+          password: jq(.secrets.EMAIL_PASSWORD)
+        emails:
+        - from: jq(.from)
+          to: jq(.to)
+          subject: jq(.subject)
+          message:
+            name: message
+            data: 'jq(.return.mustache.result)'
+          contentType: text/html
+    transition: send-slack
+  
+  #
+  # Send a slack message with the kubeconfig file attached
+  #
+  - id: send-slack
+    log: Send a slack message
+    type: action
+    action:
+      function: slack
+      secrets: ["SLACK_URL"]
+      input: 
+        webhook-url: jq(.secrets."SLACK_URL")
+        content:
+          blocks:
+          - type: header
+            text:
+              type: plain_text
+              text: jq(.subject)
+          - type: section
+            fields:
+            - type: mrkdwn
+              text: "*From:*\njq(.from)"
+            - type: mrkdwn
+              text: "*To:*\njq(.to)"
+          - type: section
+            text:
+              type: mrkdwn
+              text: "*Messsage:*\njq(.message)"
+          - type: section
+            text:
+              type: mrkdwn
+              text: 'jq( [.urls[] | "<" + . + ">"] | join("\n") )'
+    transition: send-teams
+
+  #
+  # First state entry: send a message to Microsoft Teams
+  #
+  - id: send-teams
+    type: action
+    action:
+      function: teams
+      secrets: ["TEAMS_WEBHOOK_URL"]
+      input: 
+        webhook-url: jq(.secrets.TEAMS_WEBHOOK_URL)
+        verbose: true
+        content:
+          type: message
+          attachments:
+          - contentType: application/vnd.microsoft.card.adaptive
+            content:
+              "$schema": http://adaptivecards.io/schemas/adaptive-card.json
+              type: AdaptiveCard
+              version: '1.2'
+              body:
+              - type: ColumnSet
+                columns:
+                - type: Column
+                  width: 2
+                  items:
+                  - type: TextBlock
+                    text: Email Received
+                    weight: Bolder
+                    size: ExtraLarge
+                  - type: TextBlock
+                    text: jq(.subject)
+                    isSubtle: true
+                    wrap: true
+                    size: Large
+              - type: TextBlock
+                text: '**From**: jq("[" + .from + "](" + .from + ")")'
+                wrap: true
+              - type: TextBlock
+                text: '**To**: jq( [.to[] | "[" + . + "]" + "(mailto:" + . + ")"] | join("\r") )'
+                wrap: true
+              - type: TextBlock
+                size: Medium
+                weight: Bolder
+                text: Message
+                wrap: true
+              - type: TextBlock
+                text: jq(.message)
+                wrap: true
+              - type: TextBlock
+                size: Medium
+                weight: Bolder
+                text: Attachment Links
+                wrap: true
+              - type: TextBlock
+                text: 'jq( [.urls[] | "[" + . + "]" + "(" + . + ")"] | join("\r") )'
+                wrap: true
+              
